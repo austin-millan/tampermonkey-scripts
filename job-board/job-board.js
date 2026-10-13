@@ -1,11 +1,12 @@
 // ==UserScript==
-// @name         Indeed
+// @name         Job Board Blacklist
 // @namespace    https://gitlab.com/austin-millan/tampermonkey-scripts
-// @version      1.2.0
-// @description  Auto-dislike Indeed job cards from blacklisted companies
+// @version      2.0.0
+// @description  Auto-dislike/dismiss Indeed and LinkedIn job cards from blacklisted companies
 // @author       austin-millan
 // @match        https://*.indeed.com/*
 // @match        https://indeed.com/*
+// @match        https://www.linkedin.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
@@ -28,32 +29,36 @@
     "Surge AI",
     "Turing",
     "Mercor",
+    "Ladders",
   ];
 
-  const STORAGE_KEY = "indeedCompanyBlacklist";
-  const PROCESSED_ATTR = "data-indeed-blacklist-processed";
-  const HIDDEN_ATTR = "data-indeed-blacklist-hidden";
-  const CLICK_MARK_ATTR = "data-indeed-blacklist-click";
-  const CLICK_ATTEMPTS_ATTR = "data-indeed-blacklist-click-attempts";
+  const LOG_PREFIX = "[Job Board Blacklist]";
+  const NOTIFICATION_TITLE = "Job Board Company Blacklist";
+  const STORAGE_KEY = "jobBoardCompanyBlacklist";
+  const HIDDEN_ATTR = "data-job-board-blacklist-hidden";
+  const CLICK_MARK_ATTR = "data-job-board-blacklist-click";
+  const CLICK_ATTEMPTS_ATTR = "data-job-board-blacklist-click-attempts";
   const SCAN_DEBOUNCE_MS = 250;
   const CLICK_STAGGER_MS = 200;
   const RESCAN_INTERVAL_MS = 1500;
   const MAX_CLICK_ATTEMPTS = 5;
+  const UNTITLED_JOB = "(untitled)";
 
-  const COMPANY_NAME_SELECTOR = [
+  const INDEED_COMPANY_NAME_SELECTOR = [
     '[data-testid="company-name"]',
     ".jobcard-compact-company",
   ].join(", ");
-  const DISLIKE_SELECTOR = [
+  const INDEED_DISLIKE_SELECTOR = [
     "button.dislike-tap-target",
     'button[data-testid="dislikeicon"]',
     'button[data-testid="vj-dislikeJobButton"]',
     'button[aria-label="Not interested"]',
   ].join(", ");
-  const CAROUSEL_ITEM_SELECTOR = '[data-testid="simple-carousel-item"]';
-  const GROUPING_SECTION_SELECTOR = '[data-testid="serp-grouping-section"]';
-  const JOB_CARD_SELECTORS = [
-    CAROUSEL_ITEM_SELECTOR,
+  const INDEED_TITLE_SELECTOR = '[id^="jobTitle-"], .jobTitle, .jcs-JobTitle';
+  const INDEED_CAROUSEL_ITEM_SELECTOR = '[data-testid="simple-carousel-item"]';
+  const INDEED_GROUPING_SECTION_SELECTOR = '[data-testid="serp-grouping-section"]';
+  const INDEED_JOB_CARD_SELECTORS = [
+    INDEED_CAROUSEL_ITEM_SELECTOR,
     ".jobcard-compact",
     ".cardOutline",
     ".job_seen_beacon",
@@ -64,15 +69,31 @@
     "li.css-1ac2h1w",
   ];
 
+  const LINKEDIN_JOB_CARD_SELECTOR = [
+    '[componentkey^="job-card-component-ref-"]',
+    "li[data-occludable-job-id]",
+    ".job-card-container",
+  ].join(", ");
+  const LINKEDIN_DISMISS_SELECTOR = 'button[aria-label^="Dismiss "][aria-label$=" job"]';
+  const LINKEDIN_DISMISS_LABEL_PATTERN = /^Dismiss (.+) job$/;
+  const LINKEDIN_COMPANY_NAME_SELECTOR = [
+    ".artdeco-entity-lockup__subtitle",
+    ".job-card-container__primary-description",
+    ".job-card-container__company-name",
+    'a[href*="/company/"]',
+  ].join(", ");
+
+  // ---------------------------------------------------------------------------
+  // Blacklist storage and matching
+  // ---------------------------------------------------------------------------
+
   function getBlacklist() {
     const stored = GM_getValue(STORAGE_KEY, null);
     if (stored === null || stored === undefined) {
       return [...DEFAULT_BLACKLIST];
     }
     if (!Array.isArray(stored)) {
-      console.warn(
-        "[Indeed Blacklist] Stored blacklist is invalid; using defaults."
-      );
+      console.warn(`${LOG_PREFIX} Stored blacklist is invalid; using defaults.`);
       return [...DEFAULT_BLACKLIST];
     }
     return stored.map((entry) => String(entry).trim()).filter(Boolean);
@@ -114,8 +135,26 @@
     );
   }
 
-  function findJobCard(element) {
-    for (const selector of JOB_CARD_SELECTORS) {
+  function firstNonEmptyText(nodes) {
+    for (const node of nodes) {
+      const text = node.textContent?.trim();
+      if (text) {
+        return text;
+      }
+    }
+    return "";
+  }
+
+  // ---------------------------------------------------------------------------
+  // Site adapters
+  //
+  // Each adapter exposes findJobs(), returning
+  //   { companyName, title, hideTarget, dismissControl }
+  // for every job card currently in the DOM, plus an optional afterHide() hook.
+  // ---------------------------------------------------------------------------
+
+  function findIndeedJobCard(element) {
+    for (const selector of INDEED_JOB_CARD_SELECTORS) {
       const card = element.closest(selector);
       if (card) {
         return card;
@@ -124,7 +163,7 @@
 
     let current = element.parentElement;
     while (current && current !== document.body) {
-      if (current.querySelector(DISLIKE_SELECTOR)) {
+      if (current.querySelector(INDEED_DISLIKE_SELECTOR)) {
         return current;
       }
       current = current.parentElement;
@@ -132,9 +171,9 @@
     return null;
   }
 
-  function findHideTarget(jobCard) {
+  function findIndeedHideTarget(jobCard) {
     return (
-      jobCard.closest(CAROUSEL_ITEM_SELECTOR) ||
+      jobCard.closest(INDEED_CAROUSEL_ITEM_SELECTOR) ||
       jobCard.closest("li") ||
       jobCard.closest(".cardOutline") ||
       jobCard.closest("[data-jk]") ||
@@ -142,34 +181,43 @@
     );
   }
 
-  function findDislikeControl(jobCard) {
-    const hideTarget = findHideTarget(jobCard);
-    // Covers standard cards and carousel items (incl. carousel-actions-top-right).
-    return (
-      jobCard.querySelector(DISLIKE_SELECTOR) ||
-      hideTarget.querySelector(DISLIKE_SELECTOR) ||
-      null
-    );
+  function findIndeedJobs() {
+    const jobs = [];
+    document.querySelectorAll(INDEED_COMPANY_NAME_SELECTOR).forEach((companyNode) => {
+      const companyName = companyNode.textContent?.trim();
+      if (!companyName) {
+        return;
+      }
+
+      const jobCard = findIndeedJobCard(companyNode);
+      if (!jobCard) {
+        return;
+      }
+
+      const hideTarget = findIndeedHideTarget(jobCard);
+      // Carousel items keep their dislike button outside the card body
+      // (carousel-actions-top-right), so fall back to the hide target.
+      const dismissControl =
+        jobCard.querySelector(INDEED_DISLIKE_SELECTOR) ||
+        hideTarget.querySelector(INDEED_DISLIKE_SELECTOR);
+
+      jobs.push({
+        companyName,
+        title: jobCard.querySelector(INDEED_TITLE_SELECTOR)?.textContent?.trim() || UNTITLED_JOB,
+        hideTarget,
+        dismissControl,
+      });
+    });
+    return jobs;
   }
 
-  function hideElement(target) {
-    if (target.getAttribute(HIDDEN_ATTR) === "1") {
-      return target;
-    }
-
-    target.setAttribute(HIDDEN_ATTR, "1");
-    target.style.setProperty("display", "none", "important");
-    target.setAttribute("aria-hidden", "true");
-    return target;
-  }
-
-  function cleanupEmptyGroupingSections() {
-    document.querySelectorAll(GROUPING_SECTION_SELECTOR).forEach((section) => {
+  function cleanupEmptyIndeedGroupingSections() {
+    document.querySelectorAll(INDEED_GROUPING_SECTION_SELECTOR).forEach((section) => {
       if (section.getAttribute(HIDDEN_ATTR) === "1") {
         return;
       }
 
-      const items = section.querySelectorAll(CAROUSEL_ITEM_SELECTOR);
+      const items = section.querySelectorAll(INDEED_CAROUSEL_ITEM_SELECTOR);
       if (items.length === 0) {
         return;
       }
@@ -183,13 +231,95 @@
     });
   }
 
-  function hideJobCard(jobCard) {
-    const target = hideElement(findHideTarget(jobCard));
-    cleanupEmptyGroupingSections();
+  function isOutermostLinkedInCard(card) {
+    return !card.parentElement?.closest(LINKEDIN_JOB_CARD_SELECTOR);
+  }
+
+  function getLinkedInTitle(dismissControl) {
+    const label = dismissControl?.getAttribute("aria-label") || "";
+    return label.match(LINKEDIN_DISMISS_LABEL_PATTERN)?.[1]?.trim() || "";
+  }
+
+  function textOverlapsTitle(text, title) {
+    const normalizedText = normalize(text);
+    const normalizedTitle = normalize(title);
+    return (
+      normalizedTitle !== "" &&
+      (normalizedText.includes(normalizedTitle) || normalizedTitle.includes(normalizedText))
+    );
+  }
+
+  // The newer server-driven LinkedIn UI uses obfuscated class names, so the
+  // company is found positionally: the first paragraph after the job title.
+  function findLinkedInCompanyByParagraph(card, title) {
+    const paragraphs = Array.from(card.querySelectorAll("p"));
+    const company = paragraphs.find((paragraph) => {
+      const text = paragraph.textContent?.trim();
+      return text && !textOverlapsTitle(text, title);
+    });
+    return company?.textContent?.trim() || "";
+  }
+
+  function getLinkedInCompanyName(card, title) {
+    return (
+      firstNonEmptyText(card.querySelectorAll(LINKEDIN_COMPANY_NAME_SELECTOR)) ||
+      findLinkedInCompanyByParagraph(card, title)
+    );
+  }
+
+  function findLinkedInJobs() {
+    return Array.from(document.querySelectorAll(LINKEDIN_JOB_CARD_SELECTOR))
+      .filter(isOutermostLinkedInCard)
+      .map((card) => {
+        const dismissControl = card.querySelector(LINKEDIN_DISMISS_SELECTOR);
+        const title = getLinkedInTitle(dismissControl);
+        return {
+          companyName: getLinkedInCompanyName(card, title),
+          title: title || UNTITLED_JOB,
+          hideTarget: card.closest("li") || card,
+          dismissControl,
+        };
+      })
+      .filter((job) => job.companyName);
+  }
+
+  const SITE_ADAPTERS = [
+    {
+      name: "Indeed",
+      hostnamePattern: /(^|\.)indeed\.com$/,
+      findJobs: findIndeedJobs,
+      afterHide: cleanupEmptyIndeedGroupingSections,
+    },
+    {
+      name: "LinkedIn",
+      hostnamePattern: /(^|\.)linkedin\.com$/,
+      findJobs: findLinkedInJobs,
+    },
+  ];
+
+  function detectSite() {
+    return (
+      SITE_ADAPTERS.find((site) => site.hostnamePattern.test(window.location.hostname)) || null
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hiding and dismissing
+  // ---------------------------------------------------------------------------
+
+  function hideElement(target) {
+    if (target.getAttribute(HIDDEN_ATTR) === "1") {
+      return target;
+    }
+
+    target.setAttribute(HIDDEN_ATTR, "1");
+    target.style.setProperty("display", "none", "important");
+    target.setAttribute("aria-hidden", "true");
     return target;
   }
 
-  function clickDislike(control) {
+  // Returns true when the page-context script ran and clicked the control.
+  function clickInPageContext(control) {
     const marker = `bl-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     control.setAttribute(CLICK_MARK_ATTR, marker);
 
@@ -217,12 +347,15 @@
         GM_addElement(document.documentElement, "script", {
           textContent: pageScript,
         });
-        return;
       }
     } catch (err) {
-      console.warn("[Indeed Blacklist] Page-context click failed, falling back.", err);
+      console.warn(`${LOG_PREFIX} Page-context click failed, falling back.`, err);
     }
 
+    return !control.hasAttribute(CLICK_MARK_ATTR);
+  }
+
+  function clickDirectly(control) {
     control.removeAttribute(CLICK_MARK_ATTR);
     if (typeof control.click === "function") {
       control.click();
@@ -237,13 +370,18 @@
     );
   }
 
-  function clearProcessedMarkers() {
+  function clickDismiss(control) {
+    // A strict Content-Security-Policy can silently block the injected script,
+    // which leaves the marker attribute in place.
+    if (!clickInPageContext(control)) {
+      clickDirectly(control);
+    }
+  }
+
+  function clearScriptMarkers() {
     document
-      .querySelectorAll(
-        `[${PROCESSED_ATTR}], [${HIDDEN_ATTR}], [${CLICK_MARK_ATTR}], [${CLICK_ATTEMPTS_ATTR}]`
-      )
+      .querySelectorAll(`[${HIDDEN_ATTR}], [${CLICK_MARK_ATTR}], [${CLICK_ATTEMPTS_ATTR}]`)
       .forEach((node) => {
-        node.removeAttribute(PROCESSED_ATTR);
         node.removeAttribute(HIDDEN_ATTR);
         node.removeAttribute(CLICK_MARK_ATTR);
         node.removeAttribute(CLICK_ATTEMPTS_ATTR);
@@ -256,71 +394,53 @@
       });
   }
 
-  function processJobCards() {
+  function hideBlacklistedJob(site, job, description) {
+    if (job.hideTarget.getAttribute(HIDDEN_ATTR) === "1") {
+      return;
+    }
+
+    hideElement(job.hideTarget);
+    site.afterHide?.();
+    console.info(`${LOG_PREFIX} Hid ${description}`);
+  }
+
+  // Returns true when a dismiss click was scheduled.
+  function scheduleDismiss(job, description, clickDelay) {
+    if (!job.dismissControl) {
+      return false;
+    }
+
+    const attempts = Number(job.hideTarget.getAttribute(CLICK_ATTEMPTS_ATTR) || "0");
+    if (attempts >= MAX_CLICK_ATTEMPTS) {
+      return false;
+    }
+
+    job.hideTarget.setAttribute(CLICK_ATTEMPTS_ATTR, String(attempts + 1));
+    window.setTimeout(() => {
+      clickDismiss(job.dismissControl);
+      console.info(`${LOG_PREFIX} Dismissed ${description} (attempt ${attempts + 1})`);
+    }, clickDelay);
+    return true;
+  }
+
+  function processJobs(site) {
     const blacklist = getBlacklist();
     if (blacklist.length === 0) {
       return;
     }
 
-    const companyNodes = document.querySelectorAll(COMPANY_NAME_SELECTOR);
     let clickDelay = 0;
-
-    companyNodes.forEach((companyNode) => {
-      const companyName = companyNode.textContent;
-      if (!normalize(companyName)) {
-        return;
-      }
-
-      const matchedEntry = matchesBlacklist(companyName, blacklist);
+    site.findJobs().forEach((job) => {
+      const matchedEntry = matchesBlacklist(job.companyName, blacklist);
       if (!matchedEntry) {
-        companyNode.setAttribute(PROCESSED_ATTR, "1");
         return;
       }
 
-      if (companyNode.getAttribute(PROCESSED_ATTR) === "1") {
-        return;
+      const description = `"${job.title}" from "${job.companyName}" (matched: "${matchedEntry}")`;
+      hideBlacklistedJob(site, job, description);
+      if (scheduleDismiss(job, description, clickDelay)) {
+        clickDelay += CLICK_STAGGER_MS;
       }
-
-      const jobCard = findJobCard(companyNode);
-      if (!jobCard) {
-        return;
-      }
-
-      const alreadyHidden = findHideTarget(jobCard).getAttribute(HIDDEN_ATTR) === "1";
-      const hideTarget = hideJobCard(jobCard);
-      const dislikeControl = findDislikeControl(jobCard) || findDislikeControl(hideTarget);
-
-      const title =
-        jobCard.querySelector('[id^="jobTitle-"], .jobTitle, .jcs-JobTitle')
-          ?.textContent?.trim() || "(untitled)";
-
-      if (!alreadyHidden) {
-        console.info(
-          `[Indeed Blacklist] Hid "${title}" from "${companyName.trim()}" (matched: "${matchedEntry}")`
-        );
-      }
-
-      if (!dislikeControl) {
-        return;
-      }
-
-      const attempts = Number(hideTarget.getAttribute(CLICK_ATTEMPTS_ATTR) || "0");
-      if (attempts >= MAX_CLICK_ATTEMPTS) {
-        companyNode.setAttribute(PROCESSED_ATTR, "1");
-        hideTarget.setAttribute(PROCESSED_ATTR, "1");
-        return;
-      }
-
-      hideTarget.setAttribute(CLICK_ATTEMPTS_ATTR, String(attempts + 1));
-
-      window.setTimeout(() => {
-        clickDislike(dislikeControl);
-        console.info(
-          `[Indeed Blacklist] Disliked "${title}" from "${companyName.trim()}" (matched: "${matchedEntry}", attempt ${attempts + 1})`
-        );
-      }, clickDelay);
-
-      clickDelay += CLICK_STAGGER_MS;
     });
   }
 
@@ -332,13 +452,17 @@
     };
   }
 
-  const EDITOR_ROOT_ID = "indeed-blacklist-editor-root";
+  // ---------------------------------------------------------------------------
+  // Blacklist editor UI
+  // ---------------------------------------------------------------------------
+
+  const EDITOR_ROOT_ID = "job-board-blacklist-editor-root";
 
   function closeBlacklistEditor() {
     document.getElementById(EDITOR_ROOT_ID)?.remove();
   }
 
-  function openBlacklistEditor({ readOnly = false } = {}) {
+  function openBlacklistEditor({ readOnly = false, onSave }) {
     closeBlacklistEditor();
 
     const workingList = getBlacklist();
@@ -372,7 +496,7 @@
 
     const title = document.createElement("h2");
     title.textContent = readOnly
-      ? "Indeed company blacklist"
+      ? "Job board company blacklist"
       : "Edit company blacklist";
     Object.assign(title.style, {
       margin: "0 0 6px",
@@ -567,11 +691,10 @@
       });
       saveBtn.addEventListener("click", () => {
         const next = setBlacklist(workingList);
-        clearProcessedMarkers();
-        processJobCards();
+        onSave?.();
         closeBlacklistEditor();
         GM_notification({
-          title: "Indeed Company Blacklist",
+          title: NOTIFICATION_TITLE,
           text: `Saved ${next.length} compan${next.length === 1 ? "y" : "ies"}.`,
           timeout: 2500,
         });
@@ -604,42 +727,37 @@
     }
   }
 
-  function promptEditBlacklist() {
-    openBlacklistEditor({ readOnly: false });
-  }
+  // ---------------------------------------------------------------------------
+  // Bootstrap
+  // ---------------------------------------------------------------------------
 
-  function showCurrentBlacklist() {
-    openBlacklistEditor({ readOnly: true });
-  }
-
-  function promptResetBlacklist() {
-    const confirmed = window.confirm(
-      "Reset blacklist to the script defaults?\n\n" +
-        DEFAULT_BLACKLIST.join("\n")
+  function registerMenuCommands(rescanFromScratch) {
+    GM_registerMenuCommand("Job Board Blacklist: View…", () =>
+      openBlacklistEditor({ readOnly: true })
     );
-    if (!confirmed) {
-      return;
-    }
+    GM_registerMenuCommand("Job Board Blacklist: Edit…", () =>
+      openBlacklistEditor({ readOnly: false, onSave: rescanFromScratch })
+    );
+    GM_registerMenuCommand("Job Board Blacklist: Reset to defaults", () => {
+      const confirmed = window.confirm(
+        "Reset blacklist to the script defaults?\n\n" + DEFAULT_BLACKLIST.join("\n")
+      );
+      if (!confirmed) {
+        return;
+      }
 
-    resetBlacklist();
-    clearProcessedMarkers();
-    processJobCards();
-
-    GM_notification({
-      title: "Indeed Company Blacklist",
-      text: "Blacklist reset to defaults.",
-      timeout: 2500,
+      resetBlacklist();
+      rescanFromScratch();
+      GM_notification({
+        title: NOTIFICATION_TITLE,
+        text: "Blacklist reset to defaults.",
+        timeout: 2500,
+      });
     });
   }
 
-  function registerMenuCommands() {
-    GM_registerMenuCommand("Indeed Blacklist: View…", showCurrentBlacklist);
-    GM_registerMenuCommand("Indeed Blacklist: Edit…", promptEditBlacklist);
-    GM_registerMenuCommand("Indeed Blacklist: Reset to defaults", promptResetBlacklist);
-  }
-
-  function startObserver() {
-    const scheduledScan = debounce(processJobCards, SCAN_DEBOUNCE_MS);
+  function startObserver(rescan) {
+    const scheduledScan = debounce(rescan, SCAN_DEBOUNCE_MS);
 
     const observer = new MutationObserver(scheduledScan);
     observer.observe(document.documentElement, {
@@ -647,17 +765,28 @@
       subtree: true,
     });
 
-    processJobCards();
-    scheduledScan();
-    window.setInterval(processJobCards, RESCAN_INTERVAL_MS);
+    rescan();
+    // Polling backs up the observer for in-place re-renders that don't add nodes.
+    window.setInterval(rescan, RESCAN_INTERVAL_MS);
   }
 
-  registerMenuCommands();
-  startObserver();
+  const site = detectSite();
+  if (!site) {
+    return;
+  }
+
+  const rescan = () => processJobs(site);
+  const rescanFromScratch = () => {
+    clearScriptMarkers();
+    rescan();
+  };
+
+  registerMenuCommands(rescanFromScratch);
+  startObserver(rescan);
 
   const activeCount = getBlacklist().length;
   console.info(
-    `[Indeed Blacklist] Active with ${activeCount} compan${
+    `${LOG_PREFIX} Active on ${site.name} with ${activeCount} compan${
       activeCount === 1 ? "y" : "ies"
     }. Use the Tampermonkey menu to view/edit.`
   );
