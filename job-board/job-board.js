@@ -53,7 +53,8 @@
     "Taskify",
     "Referral",
     "Crossing Work",
-    "Sundayy,"
+    "Sundayy",
+    "Wiraa",
   ];
 
   const LOG_PREFIX = "[Job Board Blacklist]";
