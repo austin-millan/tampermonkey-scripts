@@ -30,7 +30,7 @@
     "Turing",
     "Mercor",
     "Ladders",
-    "Talent Hop",
+    "TalentHop",
   ];
 
   const LOG_PREFIX = "[Job Board Blacklist]";
