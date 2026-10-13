@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Board Blacklist
 // @namespace    https://gitlab.com/austin-millan/tampermonkey-scripts
-// @version      2.0.0
+// @version      2.1.0
 // @description  Auto-dislike/dismiss Indeed and LinkedIn job cards from blacklisted companies
 // @author       austin-millan
 // @match        https://*.indeed.com/*
@@ -31,6 +31,29 @@
     "Mercor",
     "Ladders",
     "TalentHop",
+    "Speechify",
+    "tether.io",
+    "Hired",
+    "micro1",
+    "Hired Feed",
+    "Toptal",
+    "Crossover",
+    "PulseMediaNL",
+    "devjobs",
+    "Braintrust",
+    "BruntWork",
+    "Virtusa",
+    "TALENTMATE",
+    "ParamInfo",
+    "Keystone",
+    "Joveo",
+    "Quik",
+    "Twine",
+    "Proxify",
+    "Taskify",
+    "Referral",
+    "Crossing Work",
+    "Sundayy,"
   ];
 
   const LOG_PREFIX = "[Job Board Blacklist]";
