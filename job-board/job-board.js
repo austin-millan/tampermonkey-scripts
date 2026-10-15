@@ -55,6 +55,7 @@
     "Crossing Work",
     "Sundayy",
     "Wiraa",
+    "TaskVerse"
   ];
 
   const LOG_PREFIX = "[Job Board Blacklist]";
